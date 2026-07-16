@@ -55,7 +55,7 @@ struct HomeView: View {
 
     private var header: some View {
         HStack {
-            Text("livenav")
+          /*  Text("livenav")
                 .font(.system(size: 26, weight: .heavy))
                 .foregroundStyle(
                     LinearGradient(
@@ -63,7 +63,7 @@ struct HomeView: View {
                         startPoint: .leading,
                         endPoint: .trailing
                     )
-                )
+                ) */
             Spacer()
             HStack(spacing: 18) {
                 Image(systemName: "airplayvideo")
@@ -150,13 +150,14 @@ private struct HeroCard: View {
             )
 
             VStack(alignment: .leading, spacing: 8) {
+                /*
                 Text(feature.badge.uppercased())
                     .font(.caption2)
                     .fontWeight(.bold)
                     .foregroundStyle(.white.opacity(0.9))
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.brand))
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.brand)) */
                 Spacer()
 
                 HStack(spacing: 8) {

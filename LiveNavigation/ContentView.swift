@@ -16,7 +16,7 @@ struct NavItem: Identifiable {
 struct ContentView: View {
     /// Toggle between the full app (with Home/Search/etc. screens) and a
     /// bare shell that only shows the nav bar over black.
-    var showScreens: Bool = false
+    var showScreens: Bool = true
 
     @State private var items: [NavItem] = [
         NavItem(icon: .home, title: "Home"),
@@ -27,7 +27,7 @@ struct ContentView: View {
     ]
     @State private var selectedIndex = 0
 
-    init(showScreens: Bool = false) {
+    init(showScreens: Bool = true) {
         self.showScreens = showScreens
         // Give AsyncImage a real cache so posters aren't re-downloaded.
         URLCache.shared = URLCache(memoryCapacity: 50_000_000, diskCapacity: 500_000_000)
@@ -60,7 +60,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .padding(.top, 8)
+          //  .padding(.top, 8)
             .background {
                 Rectangle()
                     .fill(.ultraThinMaterial)
