@@ -29,10 +29,26 @@ struct HomeFocus: Equatable {
     var side: ArmedSide = .neutral
     /// Horizontal drag translation applied to the focused card.
     var dragX: CGFloat = 0
-    /// The row card's global frame at the moment of long-press. The flying
-    /// card in the overlay starts here and animates out to the expanded
-    /// destination — no matched geometry, no ScrollView interference.
+    /// The row card's global frame — captured at engage, kept live during
+    /// interaction so the release animation targets the current position.
     var sourceRect: CGRect = .zero
+    /// Set by the source card on release. The overlay watches this,
+    /// runs its collapse animation, then clears focus in the completion.
+    var dismissRequested: Bool = false
+    /// Flipped to true by the overlay's `.onAppear`, after its flying card
+    /// has already been rendered on top of the source. The source card
+    /// waits for this before hiding, so there's no frame where the row is
+    /// empty.
+    var overlayReady: Bool = false
+}
+
+/// Handed off from the interaction overlay to HomeView when a side has been
+/// committed. Powers the stroke + pill feedback that plays after dismissal.
+struct CompletionInfo: Equatable, Identifiable {
+    var id: UUID { itemId }
+    var itemId: UUID
+    var side: ArmedSide
+    var sourceRect: CGRect
 }
 
 struct HomeView: View {
@@ -41,6 +57,13 @@ struct HomeView: View {
 
     /// The currently focused Continue Watching card (long-pressed).
     @State private var focus: HomeFocus?
+    /// Set by the interaction overlay's collapse-completion when a side was
+    /// committed. Drives the post-release stroke + confirmation pill.
+    @State private var completion: CompletionInfo?
+    /// Live global frames of every Continue Watching row card, keyed by
+    /// item id. Kept fresh by each card's `.onGeometryChange` so overlays
+    /// (like CompletionOverlay) can follow when the row is scrolled.
+    @State private var cardFrames: [UUID: CGRect] = [:]
     @Namespace private var cardNS
 
     var body: some View {
@@ -55,7 +78,12 @@ struct HomeView: View {
 
                     RowSection(title: "Continue Watching") {
                         ForEach(MockData.continueWatching) { item in
-                            ContinueCard(item: item, focus: $focus, namespace: cardNS)
+                            ContinueCard(
+                                item: item,
+                                focus: $focus,
+                                namespace: cardNS,
+                                onFrameChange: { cardFrames[item.id] = $0 }
+                            )
                         }
                     }
 
@@ -90,7 +118,16 @@ struct HomeView: View {
 
             if let currentFocus = focus,
                let item = MockData.continueWatching.first(where: { $0.id == currentFocus.itemId }) {
-                ContinueInteractionOverlay(item: item, focus: $focus, namespace: cardNS)
+                ContinueInteractionOverlay(item: item, focus: $focus, completion: $completion, namespace: cardNS)
+            }
+
+            if let completion {
+                CompletionOverlay(
+                    info: completion,
+                    liveRect: cardFrames[completion.itemId]
+                ) {
+                    self.completion = nil
+                }
             }
         }
     }
@@ -260,6 +297,9 @@ struct ContinueCard: View {
     let item: ContinueItem
     @Binding var focus: HomeFocus?
     let namespace: Namespace.ID
+    /// Called each time the row card's global frame updates. Lets HomeView
+    /// keep a live per-item rect for follow-along overlays.
+    var onFrameChange: (CGRect) -> Void = { _ in }
 
     private let cardWidth: CGFloat = 140
     private let threshold: CGFloat = 60
@@ -324,9 +364,9 @@ struct ContinueCard: View {
                 break
             }
         }
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-            focus = nil
-        }
+        // Signal the overlay to run its reverse animation. The overlay
+        // clears focus itself once the animation completes.
+        focus?.dismissRequested = true
     }
 
     private func rubberBanded(_ x: CGFloat) -> CGFloat {
@@ -340,9 +380,19 @@ struct ContinueCard: View {
             continueCardArt(item: item, cardWidth: cardWidth)
                 .frame(width: cardWidth, height: cardWidth * 1.5)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .opacity(isFocused ? 0 : 1)
+                // Stay visible while the overlay mounts. Only hide once the
+                // overlay's flying card has actually rendered on top of us.
+                .opacity((isFocused && focus?.overlayReady == true) ? 0 : 1)
                 .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { newFrame in
                     currentFrame = newFrame
+                    onFrameChange(newFrame)
+                    // Keep the focused card's source rect in sync while the
+                    // user is actively interacting, but freeze it once
+                    // dismissal starts — otherwise a mid-collapse layout
+                    // shift causes the card position to jump.
+                    if isFocused && focus?.dismissRequested != true {
+                        focus?.sourceRect = newFrame
+                    }
                 }
                 .overlay(
                     PressAndDragCatcher(
@@ -418,6 +468,7 @@ private func continueCardArt(item: ContinueItem, cardWidth: CGFloat) -> some Vie
 struct ContinueInteractionOverlay: View {
     let item: ContinueItem
     @Binding var focus: HomeFocus?
+    @Binding var completion: CompletionInfo?
     let namespace: Namespace.ID // kept for API compatibility; not used
 
     private let cardWidth: CGFloat = 177.43       // fallback if sourceRect isn't captured
@@ -435,7 +486,12 @@ struct ContinueInteractionOverlay: View {
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.6 * (isExpanded ? 1 : 0))
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .opacity(isExpanded ? 1 : 0)
+                .ignoresSafeArea()
+
+            Color.black.opacity(0.5 * (isExpanded ? 1 : 0))
                 .ignoresSafeArea()
                 .onTapGesture { dismiss() }
 
@@ -443,9 +499,13 @@ struct ContinueInteractionOverlay: View {
                 let W = proxy.size.width
                 let overlayOrigin = proxy.frame(in: .global).origin
 
-                // Card size + on-screen anchor.
-                let cw = sourceRect.width == 0 ? cardWidth : sourceRect.width
-                let ch = sourceRect.height == 0 ? cardHeight : sourceRect.height
+                // Card size + on-screen anchor. Scales up 1.2× while expanded
+                // so the halo rectangles (derived from cw/ch) grow with it.
+                let baseCw = sourceRect.width == 0 ? cardWidth : sourceRect.width
+                let baseCh = sourceRect.height == 0 ? cardHeight : sourceRect.height
+                let scale: CGFloat = isExpanded ? 1.2 : 1.0
+                let cw = baseCw * scale
+                let ch = baseCh * scale
                 let cardX = sourceRect.midX - overlayOrigin.x + cardDragX
                 let cardY = sourceRect.midY - overlayOrigin.y
 
@@ -492,17 +552,22 @@ struct ContinueInteractionOverlay: View {
                     .opacity(isExpanded ? 1 : 0)
                     .animation(.spring(response: 0.18, dampingFraction: 0.72), value: side)
 
-                // Label in the label zone, above the card.
-                if let label = side.label {
-                    Text(label)
-                        .font(.subheadline)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.white)
-                        .contentTransition(.opacity)
-                        .position(x: cardX, y: cardY - ch / 2 - topSpace / 2)
-                        .opacity(isExpanded ? 1 : 0)
-                        .transition(.opacity.animation(.easeInOut(duration: 0.2)))
-                }
+                // Label in the label zone, above the card. Always mounted so
+                // its position tracks the card. Enters on a slow ease, exits
+                // on a quick ease so it disappears before the card can move
+                // noticeably.
+                let labelVisible = isExpanded && side.label != nil
+                Text(side.label ?? "")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.white)
+                    .contentTransition(.opacity)
+                    .position(x: cardX, y: cardY - ch / 2 - topSpace / 2)
+                    .opacity(labelVisible ? 1 : 0)
+                    .animation(
+                        labelVisible ? .easeOut(duration: 0.2) : nil,
+                        value: labelVisible
+                    )
 
                 // Card stays exactly where it was in the row, just follows the
                 // drag horizontally.
@@ -514,15 +579,167 @@ struct ContinueInteractionOverlay: View {
             }
         }
         .onAppear {
+            // Signal the source card that the flying card has rendered on
+            // top, so it's safe to hide. No animation — it's an invisible
+            // handoff (both views show identical content at the same spot).
+            focus?.overlayReady = true
             withAnimation(.easeOut(duration: 0.2)) {
                 isExpanded = true
             }
         }
+        .onChange(of: focus?.dismissRequested) { _, requested in
+            guard requested == true else { return }
+            runCollapse()
+        }
     }
 
+    /// Tap-outside-to-dismiss and gesture-release path both funnel through
+    /// this, so the reverse animation always runs.
     private func dismiss() {
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+        focus?.dismissRequested = true
+    }
+
+    private func runCollapse() {
+        // Snapshot the committed side + position before the animation nils
+        // everything out, so we can hand it to the CompletionOverlay.
+        let capturedSide = focus?.side ?? .neutral
+        let capturedRect = focus?.sourceRect ?? .zero
+        let capturedItemId = focus?.itemId
+
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) {
+            focus?.dragX = 0
+            focus?.side = .neutral
+            isExpanded = false
+        } completion: {
+            if capturedSide != .neutral, let id = capturedItemId {
+                completion = CompletionInfo(
+                    itemId: id,
+                    side: capturedSide,
+                    sourceRect: capturedRect
+                )
+            }
             focus = nil
+        }
+    }
+}
+
+/// Simple 3-point checkmark drawn as a Path so we can animate it with
+/// `.trim(from:to:)`.
+struct CheckmarkPath: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = rect.width, h = rect.height
+        path.move(to: CGPoint(x: w * 0.18, y: h * 0.55))
+        path.addLine(to: CGPoint(x: w * 0.42, y: h * 0.78))
+        path.addLine(to: CGPoint(x: w * 0.82, y: h * 0.28))
+        return path
+    }
+}
+
+/// Post-release confirmation: draws a 1.5pt stroke around the card in the
+/// selected side's color, and a small pill above the card with an animated
+/// checkmark + status text. Auto-dismisses.
+struct CompletionOverlay: View {
+    let info: CompletionInfo
+    /// Latest frame of the source card. Passed in fresh by HomeView so the
+    /// stroke + pill follow the row when the user scrolls before the
+    /// overlay finishes. Falls back to `info.sourceRect` if we don't have
+    /// a live value yet.
+    let liveRect: CGRect?
+    let onDone: () -> Void
+
+    private var currentRect: CGRect {
+        liveRect ?? info.sourceRect
+    }
+
+    @State private var strokeVisible = false
+    @State private var pillVisible = false
+    @State private var pillOffset: CGFloat = 12   // starts below final position
+    @State private var checkProgress: CGFloat = 0  // 0 → 1 for the draw-on effect
+
+    private var pillText: String {
+        switch info.side {
+        case .left:  return "Added to watchlist"
+        case .right: return "Marked as seen"
+        case .neutral: return ""
+        }
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let overlayOrigin = proxy.frame(in: .global).origin
+            let rect = currentRect
+            let cardX = rect.midX - overlayOrigin.x
+            let cardTopY = rect.minY - overlayOrigin.y
+            let cardCenterY = rect.midY - overlayOrigin.y
+
+            // Stroke around the card.
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(info.side.color, lineWidth: 1.5)
+                .frame(width: rect.width, height: rect.height)
+                .position(x: cardX, y: cardCenterY)
+                .opacity(strokeVisible ? 1 : 0)
+
+            // Pill above the card.
+            HStack(spacing: 4) {
+                CheckmarkPath()
+                    .trim(from: 0, to: checkProgress)
+                    .stroke(Color.white,
+                            style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
+                    .frame(width: 14, height: 14)
+                Text(pillText)
+            }
+            .font(.subheadline)
+            .fontWeight(.medium)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(info.side.color))
+            .fixedSize()
+            .opacity(pillVisible ? 1 : 0)
+            .offset(y: pillOffset)
+            // Anchor bottom-of-pill 8pt above the card's top edge.
+            .position(x: cardX, y: cardTopY - 8)
+            .offset(y: -22) // shift up by ~half the pill height so bottom aligns
+        }
+        // Smoothly follow the source card when the row scrolls, instead of
+        // snapping frame-by-frame.
+        .animation(.interactiveSpring(response: 0.28, dampingFraction: 0.85), value: currentRect)
+        .allowsHitTesting(false)
+        .onAppear { runSequence() }
+    }
+
+    private func runSequence() {
+        // Instant stroke, pill glides up + fades in.
+        strokeVisible = true
+        withAnimation(.easeOut(duration: 0.25)) {
+            pillVisible = true
+            pillOffset = 0
+        }
+        // Draw the checkmark on with a slightly delayed, snappier curve so
+        // it lands after the pill has arrived.
+        withAnimation(.easeOut(duration: 0.18).delay(0.1)) {
+            checkProgress = 1
+        }
+
+        Task {
+            try? await Task.sleep(for: .milliseconds(500))
+
+            // Fade the stroke over 0.2s.
+            withAnimation(.easeOut(duration: 0.2)) {
+                strokeVisible = false
+            }
+
+            try? await Task.sleep(for: .milliseconds(250))
+
+            // Pill exit: opacity + slide up.
+            withAnimation(.easeIn(duration: 0.22)) {
+                pillVisible = false
+                pillOffset = -14
+            }
+
+            try? await Task.sleep(for: .milliseconds(250))
+            onDone()
         }
     }
 }
@@ -602,6 +819,29 @@ private struct EditorialCard: View {
     }
 }
 
+/// Explicit in-memory `UIImage` cache. Bypasses `URLCache` (which won't
+/// cache responses that don't send Cache-Control headers) so any TMDBImage
+/// instance can synchronously check for a decoded image and render it on
+/// frame 1 if a prior instance already loaded the same URL.
+final class PosterImageCache: @unchecked Sendable {
+    static let shared = PosterImageCache()
+
+    private let cache = NSCache<NSString, UIImage>()
+
+    init() {
+        cache.countLimit = 400
+        cache.totalCostLimit = 200_000_000 // ~200MB decoded pixels
+    }
+
+    func image(for url: URL) -> UIImage? {
+        cache.object(forKey: url.absoluteString as NSString)
+    }
+
+    func store(_ image: UIImage, for url: URL, byteCost: Int) {
+        cache.setObject(image, forKey: url.absoluteString as NSString, cost: byteCost)
+    }
+}
+
 struct TMDBImage: View {
     let path: String
     let width: Int
@@ -610,17 +850,39 @@ struct TMDBImage: View {
         URL(string: "https://image.tmdb.org/t/p/w\(width)\(path)")
     }
 
+    /// Nil-safe sync cache read. Populated lazily by the row card's .task.
+    /// When the flying card mounts, this hit means we can render the poster
+    /// with `Image(uiImage:)` on the first frame — no AsyncImage phase gap.
+    private var cachedImage: UIImage? {
+        guard let url else { return nil }
+        return PosterImageCache.shared.image(for: url)
+    }
+
+    @State private var loadedImage: UIImage?
+
     var body: some View {
-        AsyncImage(url: url) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().scaledToFill()
-            default:
+        Group {
+            if let image = loadedImage ?? cachedImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
                 LinearGradient(
                     colors: [Color(white: 0.12), Color(white: 0.05)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
+            }
+        }
+        .task(id: url) {
+            guard let url, loadedImage == nil, cachedImage == nil else { return }
+            do {
+                let (data, _) = try await URLSession.shared.data(from: url)
+                guard let img = UIImage(data: data) else { return }
+                PosterImageCache.shared.store(img, for: url, byteCost: data.count)
+                await MainActor.run { self.loadedImage = img }
+            } catch {
+                // network failure — leave the gradient placeholder in place
             }
         }
     }
