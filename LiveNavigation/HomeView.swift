@@ -29,6 +29,10 @@ struct HomeFocus: Equatable {
     var side: ArmedSide = .neutral
     /// Horizontal drag translation applied to the focused card.
     var dragX: CGFloat = 0
+    /// The row card's global frame at the moment of long-press. The flying
+    /// card in the overlay starts here and animates out to the expanded
+    /// destination — no matched geometry, no ScrollView interference.
+    var sourceRect: CGRect = .zero
 }
 
 struct HomeView: View {
@@ -87,7 +91,6 @@ struct HomeView: View {
             if let currentFocus = focus,
                let item = MockData.continueWatching.first(where: { $0.id == currentFocus.itemId }) {
                 ContinueInteractionOverlay(item: item, focus: $focus, namespace: cardNS)
-                    .transition(.opacity)
             }
         }
     }
@@ -261,28 +264,41 @@ struct ContinueCard: View {
     private let cardWidth: CGFloat = 140
     private let threshold: CGFloat = 60
 
+    /// Latest frame of this card in global coordinates. Captured at long-press
+    /// so the overlay knows where to start its animation.
+    @State private var currentFrame: CGRect = .zero
+
     private var isFocused: Bool { focus?.itemId == item.id }
 
     private func engage() {
         guard focus?.itemId != item.id else { return }
-        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
-            focus = HomeFocus(itemId: item.id)
-        }
+        // Capture the source frame without an animation transaction so the
+        // overlay reads the correct starting point on first render.
+        focus = HomeFocus(itemId: item.id, sourceRect: currentFrame)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        // Auto-arm the side based on the card's initial on-screen position.
+        updateSide(for: 0)
     }
 
     /// Called for every touch move once the long-press has recognized.
     private func handleDrag(_ dx: CGFloat) {
         withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
-            focus?.dragX = rubberBanded(dx)
+            focus?.dragX = dx
         }
         updateSide(for: dx)
     }
 
-    private func updateSide(for x: CGFloat) {
+    /// Side is decided by the card's on-screen center + drag, relative to
+    /// the screen middle. Card follows the finger 1:1.
+    private func updateSide(for dx: CGFloat) {
+        guard let rect = focus?.sourceRect, rect != .zero else { return }
+        let screenWidth = UIScreen.main.bounds.width
+        let effectiveX = rect.midX + dx
+        let center = screenWidth / 2
+
         let next: ArmedSide
-        if x < -threshold { next = .left }
-        else if x > threshold { next = .right }
+        if effectiveX < center - threshold { next = .left }
+        else if effectiveX > center + threshold { next = .right }
         else { next = .neutral }
 
         guard focus?.side != next else { return }
@@ -324,8 +340,10 @@ struct ContinueCard: View {
             continueCardArt(item: item, cardWidth: cardWidth)
                 .frame(width: cardWidth, height: cardWidth * 1.5)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .matchedGeometryEffect(id: item.id, in: namespace, isSource: !isFocused)
                 .opacity(isFocused ? 0 : 1)
+                .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { newFrame in
+                    currentFrame = newFrame
+                }
                 .overlay(
                     PressAndDragCatcher(
                         minimumPressDuration: 0.35,
@@ -394,45 +412,49 @@ private func continueCardArt(item: ContinueItem, cardWidth: CGFloat) -> some Vie
 }
 
 /// The full-screen overlay that appears when a Continue Watching card is
-/// long-pressed. Uses matched geometry to fly the card in/out from the row.
+/// long-pressed. Uses a "flying card" that starts at `focus.sourceRect` (the
+/// row card's global frame captured at long-press) and animates to the
+/// expanded destination — no matched geometry, no ScrollView interference.
 struct ContinueInteractionOverlay: View {
     let item: ContinueItem
     @Binding var focus: HomeFocus?
-    let namespace: Namespace.ID
+    let namespace: Namespace.ID // kept for API compatibility; not used
 
-    private let cardWidth: CGFloat = 177.43
-    private let cardHeight: CGFloat = 266.14
+    private let cardWidth: CGFloat = 177.43       // fallback if sourceRect isn't captured
+    private let cardHeight: CGFloat = 266.14      // fallback
     private let peekWidth: CGFloat = 38.59
-    private var activeWidth: CGFloat { cardWidth + 24 } // 201.43 — 12pt of halo on each side
-    private let rectHeight: CGFloat = 319.87
     private let imageBottomPadding: CGFloat = 12
-
-    /// Vertical shift for the card so its bottom sits `imageBottomPadding`
-    /// above the rectangle's bottom edge. Everything above the card inside
-    /// the rectangle becomes the label zone.
-    private var cardOffsetY: CGFloat {
-        (rectHeight / 2) - (cardHeight / 2) - imageBottomPadding
-    }
-
-    /// Vertical center of the label zone (rectangle top → card top).
-    private var labelOffsetY: CGFloat {
-        let topSpace = rectHeight - cardHeight - imageBottomPadding
-        return -(rectHeight / 2) + (topSpace / 2)
-    }
+    private let topSpace: CGFloat = 41.73         // constant label zone height
 
     private var side: ArmedSide { focus?.side ?? .neutral }
     private var cardDragX: CGFloat { focus?.dragX ?? 0 }
+    private var sourceRect: CGRect { focus?.sourceRect ?? .zero }
+
+    /// Drives the fade-in of dim / rects / label (not the card position).
+    @State private var isExpanded = false
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.6)
+            Color.black.opacity(0.6 * (isExpanded ? 1 : 0))
                 .ignoresSafeArea()
                 .onTapGesture { dismiss() }
 
-            // Rectangles — always rendered, width + position animate on side.
             GeometryReader { proxy in
                 let W = proxy.size.width
-                let H = proxy.size.height
+                let overlayOrigin = proxy.frame(in: .global).origin
+
+                // Card size + on-screen anchor.
+                let cw = sourceRect.width == 0 ? cardWidth : sourceRect.width
+                let ch = sourceRect.height == 0 ? cardHeight : sourceRect.height
+                let cardX = sourceRect.midX - overlayOrigin.x + cardDragX
+                let cardY = sourceRect.midY - overlayOrigin.y
+
+                // Halo rectangle dimensions scale with the actual card size.
+                let activeWidth = cw + 24                              // 12pt halo per side
+                let rectHeight = ch + topSpace + imageBottomPadding    // label zone + card + bottom pad
+                // The rectangle is centered above the card by half the
+                // difference between top space and bottom padding.
+                let rectCenterY = cardY + (imageBottomPadding - topSpace) / 2
 
                 let leftWidth: CGFloat = {
                     switch side {
@@ -454,41 +476,47 @@ struct ContinueInteractionOverlay: View {
                     .fill(ArmedSide.left.color)
                     .frame(width: leftWidth, height: rectHeight)
                     .position(
-                        x: side == .left ? W / 2 + cardDragX : leftWidth / 2,
-                        y: H / 2
+                        x: side == .left ? cardX : leftWidth / 2,
+                        y: rectCenterY
                     )
+                    .opacity(isExpanded ? 1 : 0)
                     .animation(.spring(response: 0.18, dampingFraction: 0.72), value: side)
 
                 RoundedRectangle(cornerRadius: side == .right ? 24 : 12, style: .continuous)
                     .fill(ArmedSide.right.color)
                     .frame(width: rightWidth, height: rectHeight)
                     .position(
-                        x: side == .right ? W / 2 + cardDragX : W - rightWidth / 2,
-                        y: H / 2
+                        x: side == .right ? cardX : W - rightWidth / 2,
+                        y: rectCenterY
                     )
+                    .opacity(isExpanded ? 1 : 0)
                     .animation(.spring(response: 0.18, dampingFraction: 0.72), value: side)
-            }
 
-            // Label sitting in the top space of the active rectangle.
-            if let label = side.label {
-                Text(label)
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.white)
-                    .contentTransition(.opacity)
-                    .offset(x: cardDragX, y: labelOffsetY)
-                    .transition(.opacity.animation(.easeInOut(duration: 0.2)))
-            }
+                // Label in the label zone, above the card.
+                if let label = side.label {
+                    Text(label)
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.white)
+                        .contentTransition(.opacity)
+                        .position(x: cardX, y: cardY - ch / 2 - topSpace / 2)
+                        .opacity(isExpanded ? 1 : 0)
+                        .transition(.opacity.animation(.easeInOut(duration: 0.2)))
+                }
 
-            // Card — offset down so its bottom aligns with the rectangle's
-            // bottom minus the 12pt padding. Horizontal offset follows the
-            // finger during drag.
-            continueCardArt(item: item, cardWidth: cardWidth)
-                .frame(width: cardWidth, height: cardHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .matchedGeometryEffect(id: item.id, in: namespace, isSource: true)
-                .offset(x: cardDragX, y: cardOffsetY)
-                .shadow(color: .black.opacity(0.5), radius: 24, y: 14)
+                // Card stays exactly where it was in the row, just follows the
+                // drag horizontally.
+                continueCardArt(item: item, cardWidth: cw)
+                    .frame(width: cw, height: ch)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .position(x: cardX, y: cardY)
+                    .shadow(color: .black.opacity(isExpanded ? 0.5 : 0), radius: 24, y: 14)
+            }
+        }
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.2)) {
+                isExpanded = true
+            }
         }
     }
 
