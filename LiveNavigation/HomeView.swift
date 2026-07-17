@@ -4,53 +4,92 @@ extension Color {
     static let brand = Color(red: 229/255, green: 9/255, blue: 20/255)
 }
 
+enum ArmedSide: Equatable {
+    case neutral, left, right
+
+    var color: Color {
+        switch self {
+        case .neutral: return .clear
+        case .left:    return Color(red: 0.95, green: 0.15, blue: 0.45)
+        case .right:   return Color(red: 0.15, green: 0.45, blue: 0.95)
+        }
+    }
+
+    var label: String? {
+        switch self {
+        case .neutral: return nil
+        case .left:    return "Add to watchlist"
+        case .right:   return "Mark as Watched"
+        }
+    }
+}
+
+struct HomeFocus: Equatable {
+    var itemId: UUID
+    var side: ArmedSide = .neutral
+    /// Horizontal drag translation applied to the focused card.
+    var dragX: CGFloat = 0
+}
+
 struct HomeView: View {
     @State private var selectedCategory = "All"
     private let categories = ["All", "Movies", "Shows", "Anime", "Docs"]
 
+    /// The currently focused Continue Watching card (long-pressed).
+    @State private var focus: HomeFocus?
+    @Namespace private var cardNS
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                header
+        ZStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    header
 
-                categoryChips
+                    categoryChips
 
-                HeroCard(feature: MockData.hero)
+                    HeroCard(feature: MockData.hero)
 
-                RowSection(title: "Continue Watching") {
-                    ForEach(MockData.continueWatching) { item in
-                        ContinueCard(item: item)
+                    RowSection(title: "Continue Watching") {
+                        ForEach(MockData.continueWatching) { item in
+                            ContinueCard(item: item, focus: $focus, namespace: cardNS)
+                        }
                     }
-                }
 
-                RowSection(title: "Trending Now") {
-                    ForEach(MockData.trending) { item in
-                        PosterCard(item: item)
+                    RowSection(title: "Trending Now") {
+                        ForEach(MockData.trending) { item in
+                            PosterCard(item: item)
+                        }
                     }
-                }
 
-                TopTenSection(items: MockData.topTen)
+                    TopTenSection(items: MockData.topTen)
 
-                RowSection(title: "Because you liked House of the Dragon") {
-                    ForEach(MockData.recommended) { item in
-                        PosterCard(item: item)
+                    RowSection(title: "Because you liked House of the Dragon") {
+                        ForEach(MockData.recommended) { item in
+                            PosterCard(item: item)
+                        }
                     }
-                }
 
-                EditorialCard(item: MockData.editorial)
+                    EditorialCard(item: MockData.editorial)
 
-                RowSection(title: "New this week") {
-                    ForEach(MockData.newReleases) { item in
-                        PosterCard(item: item)
+                    RowSection(title: "New this week") {
+                        ForEach(MockData.newReleases) { item in
+                            PosterCard(item: item)
+                        }
                     }
-                }
 
-                Color.clear.frame(height: 100)
+                    Color.clear.frame(height: 100)
+                }
+                .padding(.top, 8)
             }
-            .padding(.top, 8)
+            .background(Color.black)
+            .scrollIndicators(.hidden)
+
+            if let currentFocus = focus,
+               let item = MockData.continueWatching.first(where: { $0.id == currentFocus.itemId }) {
+                ContinueInteractionOverlay(item: item, focus: $focus, namespace: cardNS)
+                    .transition(.opacity)
+            }
         }
-        .background(Color.black)
-        .scrollIndicators(.hidden)
     }
 
     private var header: some View {
@@ -214,50 +253,88 @@ private struct PosterCard: View {
     }
 }
 
-private struct ContinueCard: View {
+struct ContinueCard: View {
     let item: ContinueItem
+    @Binding var focus: HomeFocus?
+    let namespace: Namespace.ID
+
     private let cardWidth: CGFloat = 140
+    private let threshold: CGFloat = 60
+
+    private var isFocused: Bool { focus?.itemId == item.id }
+
+    private func engage() {
+        guard focus?.itemId != item.id else { return }
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+            focus = HomeFocus(itemId: item.id)
+        }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    /// Called for every touch move once the long-press has recognized.
+    private func handleDrag(_ dx: CGFloat) {
+        withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
+            focus?.dragX = rubberBanded(dx)
+        }
+        updateSide(for: dx)
+    }
+
+    private func updateSide(for x: CGFloat) {
+        let next: ArmedSide
+        if x < -threshold { next = .left }
+        else if x > threshold { next = .right }
+        else { next = .neutral }
+
+        guard focus?.side != next else { return }
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.72)) {
+            focus?.side = next
+        }
+        if next != .neutral {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
+
+    private func handleRelease() {
+        guard focus?.itemId == item.id else { return }
+        if let side = focus?.side {
+            switch side {
+            case .left:
+                print("Added \(item.title) to watchlist")
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            case .right:
+                print("Marked \(item.title) as watched")
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            case .neutral:
+                break
+            }
+        }
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+            focus = nil
+        }
+    }
+
+    private func rubberBanded(_ x: CGFloat) -> CGFloat {
+        guard abs(x) > threshold else { return x }
+        let extra = abs(x) - threshold
+        return x > 0 ? threshold + extra * 0.3 : -(threshold + extra * 0.3)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ZStack {
-                TMDBImage(path: item.posterPath, width: 342)
-                    .frame(width: cardWidth, height: cardWidth * 1.5)
-
-                Circle()
-                    .fill(.black.opacity(0.55))
-                    .frame(width: 44, height: 44)
-                    .overlay(
-                        Image(systemName: "play.fill")
-                            .foregroundStyle(.white)
+            continueCardArt(item: item, cardWidth: cardWidth)
+                .frame(width: cardWidth, height: cardWidth * 1.5)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .matchedGeometryEffect(id: item.id, in: namespace, isSource: !isFocused)
+                .opacity(isFocused ? 0 : 1)
+                .overlay(
+                    PressAndDragCatcher(
+                        minimumPressDuration: 0.35,
+                        allowableMovement: 10,
+                        onEngage: engage,
+                        onDrag: handleDrag,
+                        onEnd: handleRelease
                     )
-
-                VStack {
-                    Spacer()
-                    LinearGradient(
-                        colors: [.clear, .black.opacity(0.85)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: 44)
-                    .overlay(alignment: .bottom) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(.white.opacity(0.25))
-                            .frame(height: 3)
-                            .overlay(alignment: .leading) {
-                                GeometryReader { geo in
-                                    RoundedRectangle(cornerRadius: 2)
-                                        .fill(Color.brand)
-                                        .frame(width: geo.size.width * item.progress, height: 3)
-                                }
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.bottom, 8)
-                    }
-                }
-            }
-            .frame(width: cardWidth, height: cardWidth * 1.5)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                )
 
             Text(item.title)
                 .font(.footnote)
@@ -271,6 +348,154 @@ private struct ContinueCard: View {
                 .lineLimit(1)
         }
         .frame(width: cardWidth, alignment: .leading)
+    }
+
+}
+
+/// Shared card art used by both the row card and the interaction overlay.
+@ViewBuilder
+private func continueCardArt(item: ContinueItem, cardWidth: CGFloat) -> some View {
+    ZStack {
+        TMDBImage(path: item.posterPath, width: 342)
+            .frame(width: cardWidth, height: cardWidth * 1.5)
+
+        Circle()
+            .fill(.black.opacity(0.55))
+            .frame(width: 44, height: 44)
+            .overlay(
+                Image(systemName: "play.fill")
+                    .foregroundStyle(.white)
+            )
+
+        VStack {
+            Spacer()
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.85)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 44)
+            .overlay(alignment: .bottom) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(.white.opacity(0.25))
+                    .frame(height: 3)
+                    .overlay(alignment: .leading) {
+                        GeometryReader { geo in
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color.brand)
+                                .frame(width: geo.size.width * item.progress, height: 3)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+            }
+        }
+    }
+}
+
+/// The full-screen overlay that appears when a Continue Watching card is
+/// long-pressed. Uses matched geometry to fly the card in/out from the row.
+struct ContinueInteractionOverlay: View {
+    let item: ContinueItem
+    @Binding var focus: HomeFocus?
+    let namespace: Namespace.ID
+
+    private let cardWidth: CGFloat = 177.43
+    private let cardHeight: CGFloat = 266.14
+    private let peekWidth: CGFloat = 38.59
+    private var activeWidth: CGFloat { cardWidth + 24 } // 201.43 — 12pt of halo on each side
+    private let rectHeight: CGFloat = 319.87
+    private let imageBottomPadding: CGFloat = 12
+
+    /// Vertical shift for the card so its bottom sits `imageBottomPadding`
+    /// above the rectangle's bottom edge. Everything above the card inside
+    /// the rectangle becomes the label zone.
+    private var cardOffsetY: CGFloat {
+        (rectHeight / 2) - (cardHeight / 2) - imageBottomPadding
+    }
+
+    /// Vertical center of the label zone (rectangle top → card top).
+    private var labelOffsetY: CGFloat {
+        let topSpace = rectHeight - cardHeight - imageBottomPadding
+        return -(rectHeight / 2) + (topSpace / 2)
+    }
+
+    private var side: ArmedSide { focus?.side ?? .neutral }
+    private var cardDragX: CGFloat { focus?.dragX ?? 0 }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.6)
+                .ignoresSafeArea()
+                .onTapGesture { dismiss() }
+
+            // Rectangles — always rendered, width + position animate on side.
+            GeometryReader { proxy in
+                let W = proxy.size.width
+                let H = proxy.size.height
+
+                let leftWidth: CGFloat = {
+                    switch side {
+                    case .left:    return activeWidth
+                    case .right:   return 8
+                    case .neutral: return peekWidth
+                    }
+                }()
+
+                let rightWidth: CGFloat = {
+                    switch side {
+                    case .right:   return activeWidth
+                    case .left:    return 8
+                    case .neutral: return peekWidth
+                    }
+                }()
+
+                RoundedRectangle(cornerRadius: side == .left ? 24 : 12, style: .continuous)
+                    .fill(ArmedSide.left.color)
+                    .frame(width: leftWidth, height: rectHeight)
+                    .position(
+                        x: side == .left ? W / 2 + cardDragX : leftWidth / 2,
+                        y: H / 2
+                    )
+                    .animation(.spring(response: 0.18, dampingFraction: 0.72), value: side)
+
+                RoundedRectangle(cornerRadius: side == .right ? 24 : 12, style: .continuous)
+                    .fill(ArmedSide.right.color)
+                    .frame(width: rightWidth, height: rectHeight)
+                    .position(
+                        x: side == .right ? W / 2 + cardDragX : W - rightWidth / 2,
+                        y: H / 2
+                    )
+                    .animation(.spring(response: 0.18, dampingFraction: 0.72), value: side)
+            }
+
+            // Label sitting in the top space of the active rectangle.
+            if let label = side.label {
+                Text(label)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.white)
+                    .contentTransition(.opacity)
+                    .offset(x: cardDragX, y: labelOffsetY)
+                    .transition(.opacity.animation(.easeInOut(duration: 0.2)))
+            }
+
+            // Card — offset down so its bottom aligns with the rectangle's
+            // bottom minus the 12pt padding. Horizontal offset follows the
+            // finger during drag.
+            continueCardArt(item: item, cardWidth: cardWidth)
+                .frame(width: cardWidth, height: cardHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .matchedGeometryEffect(id: item.id, in: namespace, isSource: true)
+                .offset(x: cardDragX, y: cardOffsetY)
+                .shadow(color: .black.opacity(0.5), radius: 24, y: 14)
+        }
+    }
+
+    private func dismiss() {
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) {
+            focus = nil
+        }
     }
 }
 
